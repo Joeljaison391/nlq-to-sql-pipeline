@@ -260,6 +260,16 @@ I went stage by stage:
 
 ---
 
+## Additional Improvements
+
+- [x] **Self-correcting SQL generation**
+  - Description: when the validator rejects the LLM's SQL, the pipeline sends the validation error message back to the model and asks it to fix its own query (one attempt). If the corrected SQL passes validation, the pipeline continues normally. This turned ~8% failures into successes on harder questions without any change to the prompt or model. Implemented in `src/pipeline.py` (correction loop) and `src/llm_client.py` (`fix_sql` method).
+
+- [x] **SQL-level result cache**
+  - Description: a second cache layer keyed by the SQL string itself (not the question). Two different questions that generate the same SQL (e.g. "how many users?" and "count all respondents?" both producing `SELECT COUNT(*) FROM gaming_mental_health`) only hit the database once. The DB result is reused while the answer is still generated fresh per question. TTL is shorter (2 minutes) than the question cache since SQL results are more sensitive to data freshness. Implemented in `src/pipeline.py` alongside the existing question-level cache.
+
+---
+
 ## Optional: Multi-Turn Conversation Support
 
 **Not implemented in this submission** - out of scope given the time budget;

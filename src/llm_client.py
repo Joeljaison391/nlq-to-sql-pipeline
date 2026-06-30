@@ -143,6 +143,38 @@ class OpenRouterLLMClient:
         llm_stats["model"] = self.model
         return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000, llm_stats=llm_stats, error=error)
 
+    def fix_sql(self, question, bad_sql, validation_error):
+        system_prompt = (
+            "You are a SQL assistant. The query you wrote has a validation error. "
+            "Fix it and return only the corrected SQL as JSON: {\"sql\": \"<fixed query>\"}\n\n"
+            f"{_SCHEMA_TEXT}\n\n"
+            "Rules: SELECT only, use only the columns listed above, standard SQLite functions only."
+        )
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Your previous SQL:\n{bad_sql}\n\n"
+            f"Validation error: {validation_error}\n\n"
+            "Please fix the SQL."
+        )
+
+        start = time.perf_counter()
+        sql = None
+        error = None
+        try:
+            text = self._chat(
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.0,
+                max_tokens=300,
+            )
+            sql = self._extract_sql(text)
+        except Exception as exc:
+            error = str(exc)
+            logger.error("SQL fix attempt failed: %s", exc)
+
+        llm_stats = self.pop_stats()
+        llm_stats["model"] = self.model
+        return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000, llm_stats=llm_stats, error=error)
+
     def generate_answer(self, question, sql, rows):
         if not sql:
             return AnswerGenerationOutput(
