@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pandas as pd
 import streamlit as st
 
@@ -10,13 +12,6 @@ st.set_page_config(page_title="Gaming & Mental Health Analytics", page_icon="ðŸŽ
 st.title("ðŸŽ® Gaming & Mental Health - Ask in Plain English")
 st.caption("Type a question about the survey data and get a plain-English answer.")
 
-
-@st.cache_resource(show_spinner="Starting up...")
-def get_pipeline():
-    load_settings()
-    return AnalyticsPipeline()
-
-
 EXAMPLE_QUESTIONS = [
     "How does gaming addiction level vary between genders?",
     "Which age groups report the highest addiction levels?",
@@ -24,13 +19,43 @@ EXAMPLE_QUESTIONS = [
     "How many respondents have high addiction level (>= 5)?",
 ]
 
+
+@st.cache_resource(show_spinner="Starting up...")
+def get_pipeline():
+    load_settings()
+    pipeline = AnalyticsPipeline()
+
+    def warm_cache():
+        for q in EXAMPLE_QUESTIONS:
+            try:
+                pipeline.run(q)
+            except Exception:
+                pass
+
+    threading.Thread(target=warm_cache, daemon=True).start()
+    return pipeline
+
+
+if "conversation_history" not in st.session_state:
+    st.session_state.conversation_history = []
+
 with st.sidebar:
     st.header("About this dataset")
     st.write("Single table with one row per survey respondent: demographics, gaming habits, and mental-health scores.")
+
     st.subheader("Try an example")
     for q in EXAMPLE_QUESTIONS:
         if st.button(q, use_container_width=True):
             st.session_state["question_input"] = q
+
+    if st.session_state.conversation_history:
+        st.divider()
+        st.subheader("Conversation history")
+        for i, turn in enumerate(st.session_state.conversation_history):
+            st.caption(f"Q{i+1}: {turn['question'][:60]}...")
+        if st.button("Clear history"):
+            st.session_state.conversation_history = []
+            st.rerun()
 
 question = st.text_input("Your question", key="question_input", placeholder="e.g. Which age group has the lowest average anxiety score?")
 ask_clicked = st.button("Ask", type="primary")
@@ -43,7 +68,10 @@ if ask_clicked and question.strip():
         st.stop()
 
     with st.spinner("Thinking..."):
-        result = pipeline.run(question.strip())
+        result = pipeline.run(
+            question.strip(),
+            conversation_history=st.session_state.conversation_history,
+        )
 
     status_styles = {
         "success": st.success,
@@ -77,6 +105,15 @@ if ask_clicked and question.strip():
         col3.metric("Total tokens", result.total_llm_stats.get("total_tokens", 0))
         st.json(result.timings)
         st.json(result.total_llm_stats)
+
+    if result.status == "success":
+        st.session_state.conversation_history.append({
+            "question": question.strip(),
+            "sql": result.sql,
+            "answer": result.answer,
+        })
+        if len(st.session_state.conversation_history) > 10:
+            st.session_state.conversation_history = st.session_state.conversation_history[-10:]
 
 elif ask_clicked:
     st.warning("Please type a question first.")

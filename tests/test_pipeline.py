@@ -17,6 +17,9 @@ class FakeLLMClient:
         self.generate_answer_calls = 0
 
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
+        return self.generate_sql_with_context(question, "", [])
+
+    def generate_sql_with_context(self, question, schema_text, history=None) -> SQLGenerationOutput:
         self.generate_sql_calls += 1
         if self.raise_on_generate_sql:
             raise RuntimeError("simulated catastrophic failure")
@@ -25,6 +28,16 @@ class FakeLLMClient:
             timing_ms=1.0,
             llm_stats={"llm_calls": 1, "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "model": "fake"},
         )
+
+    def fix_sql(self, question, bad_sql, validation_error):
+        return SQLGenerationOutput(
+            sql=None, timing_ms=1.0,
+            llm_stats={"llm_calls": 1, "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "model": "fake"},
+        )
+
+    def _chat(self, messages, temperature, max_tokens):
+        # schema linker + judge calls — return safe fallback JSON
+        return '{"columns": ["age", "gender"], "correct": true}'
 
     def generate_answer(self, question: str, sql, rows) -> AnswerGenerationOutput:
         self.generate_answer_calls += 1

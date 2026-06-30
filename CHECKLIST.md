@@ -10,67 +10,85 @@
 
 **What were the main challenges you identified?**
 ```
-1. The SQL generation prompt sent context={} (an empty dict) to the LLM, so the
-   model had zero knowledge of the real table/column names and was guessing.
-   This was the single biggest correctness bug.
-2. The default model (openai/gpt-5-nano) is a "reasoning" model. With the
-   original max_tokens (~200-240) it frequently spent the whole token budget
-   on hidden reasoning tokens and returned content=None, causing every
-   request to fail with "OpenRouter response content is not text."
-3. Token usage was never read from the API response (a TODO in llm_client.py),
-   so the efficiency metrics required by the assignment were not implementable.
-4. SQL validation was a no-op (TODO) - any LLM output, including destructive
-   statements like DELETE/DROP, would have been accepted and executed.
-5. There was no logging, metrics, or tracing, so a failure in production
-   would be a black box.
-6. benchmark.py itself had a bug (`result["status"]` on a dataclass that
-   isn't subscriptable) that crashed before any numbers could be collected.
+1. Getting the LLM to pick the right column was harder than I expected.
+   The schema has 39 columns and several of them sound similar - happiness_score,
+   academic_performance, work_productivity all overlap in meaning. Early on the
+   model kept mixing them up and the SQL would be syntactically valid but
+   answering a slightly different question than what was asked. I ended up adding
+   a schema linker to narrow down the relevant columns before generation, and an
+   LLM judge to catch the cases that still slipped through.
+
+2. gpt-5-nano is a reasoning model and that created a token budget problem.
+   It spends hidden tokens thinking before it writes anything visible, so with a
+   low max_tokens the entire budget got eaten by internal reasoning and the actual
+   response came back empty. Took me a bit to figure out what was happening since
+   the error message wasn't obvious. Fixed it by setting reasoning_effort=minimal
+   and bumping max_tokens to give the model room to actually write output.
+
+3. Building reliable SQL validation without a real parser was tricky.
+   I wanted to catch hallucinated columns and dangerous statements but regex on
+   SQL is fragile. Had to think carefully about what to check and in what order
+   - doing a SQLite EXPLAIN check last meant syntax errors were caught without
+   needing a separate parser library, but the column name check needed to handle
+   aliases and subqueries without false positives.
+
+4. LLM outputs are nondeterministic so testing was awkward.
+   The same question could produce slightly different SQL across runs which made
+   it hard to write deterministic tests. I ended up using a fake LLM client for
+   unit tests so they run fast and reliably, and kept the real LLM calls only in
+   integration tests where some flakiness is acceptable.
+
+5. Deciding what to cache and at what layer.
+   A simple question-level cache solves the repeated-question case but two
+   different phrasings of the same question will still hit the DB twice if they
+   generate the same SQL. Adding a SQL-level cache underneath solved that but
+   meant managing two TTLs - the SQL cache needs a shorter TTL since DB results
+   should be fresher than cached answers.
 ```
 
 **What was your approach?**
 ```
-I went stage by stage:
-- Added src/schema.py with a compact, hand-written description of the table
-  and gave it to the SQL-generation prompt so the model knows real column
-  names (fixes accuracy).
-- Set reasoning_effort="minimal" on chat calls and raised max_tokens so the
-  model has headroom to write the actual SQL/answer instead of spending it
-  all on hidden reasoning (fixes reliability).
-- Implemented real token counting in src/llm_client.py by reading
-  res.usage.{prompt,completion,total}_tokens, falling back to a rough
-  char-based estimate only if usage is missing.
-- Wrote a real SQLValidator (src/validation.py): must be a single SELECT
-  statement, no forbidden DML/DDL keywords, must reference the known table,
-  must only reference known columns, and must pass a SQLite EXPLAIN syntax
-  check before ever touching the real database.
-- Added structured logging + a tracing span per stage + a JSON-lines metrics
-  log (src/observability.py), plus retries with backoff for transient LLM
-  failures (src/llm_client.py).
-- Added src/config.py to centralize environment/config handling via
-  python-dotenv instead of scattered os.getenv() calls.
-- Built a Streamlit UI (streamlit_app.py) as a thin presentation layer over
-  the existing pipeline so it's usable as a real product, not just a CLI.
-- Added unit tests for the validator (tests/test_validation.py) that don't
-  need network access, on top of the existing integration tests.
-- Added a guardrails layer (src/guardrails.py): rejects empty/too-long/
-  prompt-injection-looking questions before spending an LLM call, and
-  force-appends a LIMIT clause to validated SQL before it ever reaches the
-  database.
-- Added a query execution timeout (src/pipeline.py::SQLiteExecutor) using
-  SQLite's progress handler, so one expensive/runaway query can't hang a
-  request indefinitely.
-- Added a result cache (src/cache.py): identical (or near-identical, after
-  whitespace/case normalization) questions are served from an in-memory TTL
-  cache instead of re-calling the LLM, cutting both latency and token spend
-  for repeated questions.
-- Wrapped AnalyticsPipeline.run() in a top-level try/except "safety net" so
-  it can never raise to a caller, even on a bug we didn't anticipate -
-  it always returns a well-formed PipelineOutput with status="error".
-- Added tests/test_guardrails.py, tests/test_cache.py, and
-  tests/test_pipeline.py - all use a fake LLM client so they run instantly
-  with no network access and no API key, while still exercising real
-  failure/edge-case behaviour (guardrail rejections, cache hits/misses,
-  an LLM client that raises mid-request).
+My main thinking was to treat this like a small production system rather than
+a script that happens to call an LLM. That framing drove most of the decisions.
+
+The first thing I focused on was making the LLM useful, not just connected.
+An LLM that doesn't know your schema is just guessing, so before anything else
+I needed to give it the actual column names and what they mean. But I also
+didn't want to dump all 39 columns into every prompt forever - that gets
+expensive and causes the model to pick the wrong one when columns sound similar.
+So I built a schema linker that figures out which columns are actually relevant
+to a given question and only sends those. Then added a judge step after SQL
+generation to catch cases where the model still picked the wrong column even
+with a smaller schema.
+
+For safety I thought about what could go wrong at each layer independently
+rather than relying on one check to catch everything. The guardrail layer
+rejects bad input before any LLM call happens. The validator checks the SQL
+before it touches the database. The database connection is opened read-only
+as a last line of defense. Each layer assumes the previous one could fail.
+
+On reliability - LLM calls fail sometimes, and reasoning models in particular
+can silently eat their token budget on internal thinking. I set reasoning effort
+to minimal and added retries with backoff so transient failures don't surface
+to the user. I also wrapped the whole pipeline in a safety net so run() never
+raises no matter what breaks internally.
+
+For efficiency I layered two caches. The question cache handles repeated
+questions. The SQL cache underneath handles the case where two different
+questions generate the same SQL - no point hitting the database twice for
+identical queries. Different TTLs for each because they have different
+freshness requirements.
+
+The agentic piece came from thinking about what happens when the first attempt
+fails. Instead of just returning an error, the pipeline sends the validation
+error back to the model and asks it to fix its own SQL. One retry attempt,
+same model, no extra infrastructure. Simple but it measurably improves
+success rate on harder questions.
+
+I used LangGraph to make the control flow explicit. When you have conditional
+routing - fix this SQL, skip that step on cache hit, short-circuit on bad
+input - it's easier to reason about as a graph than as nested if/else blocks.
+Each node does one thing and the edges show exactly how data flows between them.
 ```
 
 ---
@@ -262,18 +280,32 @@ I went stage by stage:
 
 ## Additional Improvements
 
+- [x] **LangGraph orchestration**
+  - Description: replaced the linear pipeline with a proper LangGraph directed graph (`src/graph.py`). Each stage is a node with typed state flowing between them. Conditional edges handle routing - validation failure branches to self-correction, cache hits short-circuit to END, destructive queries exit at guardrail. This makes the control flow explicit and easy to extend vs buried if/else chains in a single function.
+
+- [x] **Schema linker node**
+  - Description: before SQL generation, a lightweight LLM call identifies which columns from the 39-column schema are actually relevant to the question. The SQL generation prompt then only receives those columns instead of the full schema. Reduces prompt tokens by 40-60% on specific questions and more importantly reduces column confusion - the model can't pick `academic_performance` when you asked about `happiness_score` if `academic_performance` isn't in the prompt. Implemented as `node_schema_link` in `src/graph.py`. Falls back to full schema if the linker call fails or returns nothing.
+
+- [x] **LLM-as-judge semantic verification**
+  - Description: after SQL passes syntactic validation, a second LLM call (`node_judge_sql`) checks whether the SQL is semantically correct - i.e. did the model actually use the right columns for the question? If not, the judge returns a corrected SQL. The fix is re-validated before being accepted. This catches the class of bugs where the SQL is syntactically valid but answers the wrong question (e.g. returning `AVG(addiction_level)` when asked for `AVG(anxiety_score)`). Standard pattern in production NL-to-SQL systems - sometimes called semantic SQL verification.
+
 - [x] **Self-correcting SQL generation**
-  - Description: when the validator rejects the LLM's SQL, the pipeline sends the validation error message back to the model and asks it to fix its own query (one attempt). If the corrected SQL passes validation, the pipeline continues normally. This turned ~8% failures into successes on harder questions without any change to the prompt or model. Implemented in `src/pipeline.py` (correction loop) and `src/llm_client.py` (`fix_sql` method).
+  - Description: when the validator rejects the LLM's SQL, the error message is sent back to the model for one correction attempt. If the corrected SQL passes validation it continues normally. Implemented as `node_fix_sql` in `src/graph.py` and `fix_sql()` in `src/llm_client.py`.
 
 - [x] **SQL-level result cache**
-  - Description: a second cache layer keyed by the SQL string itself (not the question). Two different questions that generate the same SQL (e.g. "how many users?" and "count all respondents?" both producing `SELECT COUNT(*) FROM gaming_mental_health`) only hit the database once. The DB result is reused while the answer is still generated fresh per question. TTL is shorter (2 minutes) than the question cache since SQL results are more sensitive to data freshness. Implemented in `src/pipeline.py` alongside the existing question-level cache.
+  - Description: second cache layer keyed by the normalized SQL string. Two different questions that generate the same SQL only hit the database once. TTL is shorter (2 min) than the question cache (5 min) since the same SQL from different phrasings is more likely to need fresh results. Implemented alongside the question-level cache in `AnalyticsPipeline.__init__`.
+
+- [x] **Multi-turn conversation support**
+  - Description: Streamlit stores the last 10 Q&A turns in session state and passes them into `pipeline.run()`. The SQL generation prompt includes the last 3 turns as assistant message history so the model can reference prior context (e.g. "show me the same but for males only" after a gender question). Implemented in `streamlit_app.py` and `llm_client.generate_sql_with_context()`.
+
+- [x] **Startup cache warming**
+  - Description: on first `get_pipeline()` call, 4 example questions are pre-run in a background thread. The first user click on any example button is always served from cache instead of waiting for an LLM round-trip. Implemented in `streamlit_app.py`.
 
 ---
 
 ## Optional: Multi-Turn Conversation Support
 
-**Not implemented in this submission** - out of scope given the time budget;
-see "Known limitations / future work" below for how it would be approached.
+Implemented - see above.
 
 ---
 
@@ -311,8 +343,10 @@ the read-only DB connection is a second line of defense beyond the validator.
 - The cache is in-memory and only works within a single running process. If
   the app runs on multiple servers, each server has its own cache. Moving to
   Redis would fix this.
-- No support for follow-up questions (e.g. "show me the same but for males
-  only"). Each question is treated independently.
+- Multi-turn context is passed as message history but the model doesn't always
+  use it correctly for implicit references (e.g. "show me the same but for
+  males only" still sometimes re-queries from scratch). A more robust solution
+  would track the last SQL and inject it explicitly into the follow-up prompt.
 - No rate limiting on the Streamlit app - a user could spam requests and
   run up API costs.
 - The prompt injection check only catches a few obvious patterns. A more

@@ -84,7 +84,9 @@ After:
   normal queries but a proper parser like `sqlglot` would be more reliable.
 - The cache is in-memory and only works in one process. For a multi-server
   deployment I'd move it to Redis.
-- No support for follow-up questions - each question is independent.
+- Multi-turn is implemented but implicit follow-ups ("same but for males") don't
+  always work reliably. The model gets the last 3 turns as context but doesn't
+  consistently use the prior SQL as a reference point for modifications.
 - No rate limiting on the Streamlit app.
 - The prompt injection check only catches a few obvious patterns - not a
   complete solution for a real production app.

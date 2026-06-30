@@ -28,7 +28,6 @@ class OpenRouterLLMClient:
             from openrouter import OpenRouter
         except ModuleNotFoundError as exc:
             raise RuntimeError("Missing dependency: install 'openrouter'.") from exc
-
         self.model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
@@ -52,7 +51,6 @@ class OpenRouterLLMClient:
                 prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
                 completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
                 total_tokens = getattr(usage, "total_tokens", None) if usage else None
-
                 choices = getattr(res, "choices", None) or []
                 if not choices:
                     raise RuntimeError("No choices in response.")
@@ -76,7 +74,7 @@ class OpenRouterLLMClient:
             except Exception as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    logger.warning("LLM attempt %d failed: %s. Retrying...", attempt + 1, exc)
+                    logger.warning("llm attempt %d failed: %s, retrying", attempt + 1, exc)
                     time.sleep(self.retry_backoff_s * (attempt + 1))
                 else:
                     logger.error("LLM failed after %d attempts: %s", attempt + 1, exc)
@@ -108,11 +106,11 @@ class OpenRouterLLMClient:
             return sql.rstrip(";")
         return None
 
-    def generate_sql(self, question, context):
-        system_prompt = (
+    def _sql_system_prompt(self, schema_text):
+        return (
             "You are a SQL assistant for a SQLite analytics database. "
             "Generate a SQLite query that answers the user's question, using ONLY the table and columns listed below.\n\n"
-            f"{_SCHEMA_TEXT}\n\n"
+            f"{schema_text}\n\n"
             "Rules:\n"
             "- If the question asks to read/aggregate data, write a SELECT query.\n"
             "- If the question asks to modify data (insert/update/delete/drop/etc.), "
@@ -125,23 +123,32 @@ class OpenRouterLLMClient:
             "- Respond with a JSON object: {\"sql\": \"<query>\"}\n"
         )
 
+    def generate_sql(self, question, context):
+        return self.generate_sql_with_context(question, _SCHEMA_TEXT, [])
+
+    def generate_sql_with_context(self, question, schema_text, history=None):
+        system_prompt = self._sql_system_prompt(schema_text)
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in (history or [])[-3:]:
+            messages.append({"role": "user", "content": turn.get("question", "")})
+            if turn.get("sql"):
+                messages.append({"role": "assistant", "content": f"{{\"sql\": \"{turn['sql']}\"}}"})
+        messages.append({"role": "user", "content": f"Question: {question}"})
+
         start = time.perf_counter()
         error = None
         sql = None
         try:
-            text = self._chat(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Question: {question}"}],
-                temperature=0.0,
-                max_tokens=300,
-            )
+            text = self._chat(messages=messages, temperature=0.0, max_tokens=300)
             sql = self._extract_sql(text)
         except Exception as exc:
             error = str(exc)
-            logger.error("SQL generation failed: %s", exc)
+            logger.error("sql gen failed: %s", exc)
 
         llm_stats = self.pop_stats()
         llm_stats["model"] = self.model
-        return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000, llm_stats=llm_stats, error=error)
+        return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000,
+            llm_stats=llm_stats, error=error)
 
     def fix_sql(self, question, bad_sql, validation_error):
         system_prompt = (
@@ -162,18 +169,21 @@ class OpenRouterLLMClient:
         error = None
         try:
             text = self._chat(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.0,
-                max_tokens=300,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0, max_tokens=300,
             )
             sql = self._extract_sql(text)
         except Exception as exc:
             error = str(exc)
-            logger.error("SQL fix attempt failed: %s", exc)
+            logger.error("fix attempt failed: %s", exc)
 
         llm_stats = self.pop_stats()
         llm_stats["model"] = self.model
-        return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000, llm_stats=llm_stats, error=error)
+        return SQLGenerationOutput(sql=sql, timing_ms=(time.perf_counter() - start) * 1000,
+            llm_stats=llm_stats, error=error)
 
     def generate_answer(self, question, sql, rows):
         if not sql:
@@ -183,6 +193,15 @@ class OpenRouterLLMClient:
                 llm_stats={"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": self.model},
                 error=None,
             )
+
+        if rows and all(v is None for row in rows for v in row.values()):
+            return AnswerGenerationOutput(
+                answer="I cannot answer this with the available data - the requested information is not in the dataset.",
+                timing_ms=0.0,
+                llm_stats={"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": self.model},
+                error=None,
+            )
+
         if not rows:
             return AnswerGenerationOutput(
                 answer="Query executed but returned no rows.",
@@ -205,19 +224,19 @@ class OpenRouterLLMClient:
             answer = self._chat(
                 messages=[
                     {"role": "system", "content": "You are a concise analytics assistant. Use only the provided SQL results. Do not invent data."},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
-                max_tokens=300,
+                temperature=0.2, max_tokens=300,
             )
         except Exception as exc:
             error = str(exc)
             answer = "Sorry, couldn't generate an answer right now. Please try again."
-            logger.error("Answer generation failed: %s", exc)
+            logger.error("answer gen failed: %s", exc)
 
         llm_stats = self.pop_stats()
         llm_stats["model"] = self.model
-        return AnswerGenerationOutput(answer=answer, timing_ms=(time.perf_counter() - start) * 1000, llm_stats=llm_stats, error=error)
+        return AnswerGenerationOutput(answer=answer, timing_ms=(time.perf_counter() - start) * 1000,
+            llm_stats=llm_stats, error=error)
 
     def pop_stats(self):
         out = dict(self._stats)

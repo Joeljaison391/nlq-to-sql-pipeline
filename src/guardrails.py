@@ -11,6 +11,18 @@ _INJECTION_PATTERNS = [
     re.compile(r"disregard (your|the) (rules|instructions)", re.IGNORECASE),
 ]
 
+_DESTRUCTIVE_PATTERNS = [
+    re.compile(r"\b(delete|drop|truncate|update|insert|alter)\b.*(table|row|rows|record|data|database)", re.IGNORECASE),
+    re.compile(r"\b(remove all|erase all|wipe all)\b", re.IGNORECASE),
+]
+
+
+def check_destructive_intent(question):
+    for p in _DESTRUCTIVE_PATTERNS:
+        if p.search(question):
+            return True
+    return False
+
 
 class GuardrailError(Exception):
     pass
