@@ -1,0 +1,4 @@
+openrouter
+pandas
+python-dotenv
+streamlit
